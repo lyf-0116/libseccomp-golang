@@ -73,6 +73,11 @@ type ScmpCondition struct {
 	Op       ScmpCompareOp `json:"operator,omitempty"`
 	Operand1 uint64        `json:"operand_one,omitempty"`
 	Operand2 uint64        `json:"operand_two,omitempty"`
+	// ArgumentArch is the ABI whose argument numbering Argument uses.
+	// The zero value (ArchInvalid) means the caller is supplying a raw
+	// libseccomp argument index without ABI metadata. Conditions created
+	// by MakeCondition record the native architecture instead.
+	ArgumentArch ScmpArch `json:"argument_arch,omitempty"`
 }
 
 // Seccomp userspace notification structures associated with filters that use the ActNotify action.
@@ -556,23 +561,60 @@ func GetSyscallFromNameByArch(name string, arch ScmpArch) (ScmpSyscall, error) {
 	return ScmpSyscall(result), nil
 }
 
-// MakeCondition creates and returns a new condition to attach to a filter rule.
-// Associated rules will only match if this condition is true.
-// Accepts the number the argument we are checking, and a comparison operator
-// and value to compare to.
-// The rule will match if argument $arg (zero-indexed) of the syscall is
-// $COMPARE_OP the provided comparison value.
+// MakeCondition creates and returns a new condition to attach to a filter
+// rule. The returned condition records the native architecture as the ABI
+// used to interpret arg. Use MakeConditionForArch when the index was written
+// for another architecture's ABI.
+//
+// Associated rules will only match if this condition is true. Accepts the
+// number the argument we are checking, and a comparison operator and value to
+// compare to. The rule will match if argument $arg (zero-indexed by the
+// recorded ABI) of the syscall is $COMPARE_OP the provided comparison value.
 // Some comparison operators accept two values. Masked equals, for example,
-// will mask $arg of the syscall with the second value provided (via bitwise
-// AND) and then compare against the first value provided.
+// will mask $arg of the syscall with the first value provided (via bitwise
+// AND) and then compare against the second value provided.
 // For example, in the less than or equal case, if the syscall argument was
 // 0 and the value provided was 1, the condition would match, as 0 is less
 // than or equal to 1.
+//
+// Comparisons use the full 64-bit value exposed by seccomp_data. For an
+// argument whose ABI type is 32-bit, the kernel may ignore the upper 32 bits
+// while seccomp does not; use CompareMaskedEqual with 0xffffffff as the first
+// value and the expected 32-bit value as the second to avoid that mismatch.
 // Return either an error on bad argument or a valid ScmpCondition struct.
 func MakeCondition(arg uint, comparison ScmpCompareOp, values ...uint64) (ScmpCondition, error) {
+	nativeArch, err := GetNativeArch()
+	if err != nil {
+		return ScmpCondition{}, err
+	}
+
+	return MakeConditionForArch(arg, nativeArch, comparison, values...)
+}
+
+// MakeConditionForArch creates a condition whose Argument index is interpreted
+// using arch's syscall ABI. This is the architecture-aware counterpart of
+// MakeCondition; ArchNative is resolved to the concrete native architecture.
+//
+// Argument numbering is ABI specific, especially when 32-bit ABIs split or
+// align values differently from 64-bit ABIs. The recorded architecture is
+// checked when the rule is added to a filter so that an x86_64 index is not
+// silently applied as an x86 argument index. There is no generic index
+// translation: callers must rewrite arg for the target ABI before calling this
+// function, or construct separate single-architecture filters and merge them.
+func MakeConditionForArch(arg uint, arch ScmpArch, comparison ScmpCompareOp, values ...uint64) (ScmpCondition, error) {
 	var condStruct ScmpCondition
 
 	if err := ensureSupportedVersion(); err != nil {
+		return condStruct, err
+	}
+	if arch == ArchNative {
+		nativeArch, err := GetNativeArch()
+		if err != nil {
+			return condStruct, err
+		}
+		arch = nativeArch
+	}
+	if err := sanitizeArch(arch); err != nil {
 		return condStruct, err
 	}
 
@@ -589,6 +631,7 @@ func MakeCondition(arg uint, comparison ScmpCompareOp, values ...uint64) (ScmpCo
 	condStruct.Argument = arg
 	condStruct.Op = comparison
 	condStruct.Operand1 = values[0]
+	condStruct.ArgumentArch = arch
 	if len(values) == 2 {
 		condStruct.Operand2 = values[1]
 	} else {
@@ -618,9 +661,10 @@ func GetNativeArch() (ScmpArch, error) {
 // A filter context is initially empty. Rules can be added to it, and it can
 // then be loaded into the kernel.
 type ScmpFilter struct {
-	filterCtx C.scmp_filter_ctx
-	valid     bool
-	lock      sync.Mutex
+	filterCtx           C.scmp_filter_ctx
+	valid               bool
+	hasConditionalRules bool
+	lock                sync.Mutex
 }
 
 // NewFilter creates and returns a new filter context.  Accepts a default action to be
@@ -683,6 +727,7 @@ func (f *ScmpFilter) Reset(defaultAction ScmpAction) error {
 		return errRc(retCode)
 	}
 
+	f.hasConditionalRules = false
 	return nil
 }
 
@@ -734,6 +779,7 @@ func (f *ScmpFilter) Merge(src *ScmpFilter) error {
 		return e
 	}
 
+	f.hasConditionalRules = f.hasConditionalRules || src.hasConditionalRules
 	src.valid = false
 
 	return nil
@@ -776,6 +822,10 @@ func (f *ScmpFilter) IsArchPresent(arch ScmpArch) (bool, error) {
 // Accepts an architecture constant.
 // Returns an error on invalid filter context or architecture token, or an
 // issue with the call to libseccomp.
+//
+// Adding a new ABI after conditional argument rules returns an error because
+// their argument indices may not have the same meaning on the new ABI. Create
+// an architecture-specific filter and merge disjoint filters for that case.
 func (f *ScmpFilter) AddArch(arch ScmpArch) error {
 	f.lock.Lock()
 	defer f.lock.Unlock()
@@ -784,6 +834,28 @@ func (f *ScmpFilter) AddArch(arch ScmpArch) error {
 		return err
 	} else if !f.valid {
 		return errBadFilter
+	}
+
+	if arch == ArchNative {
+		nativeArch, err := GetNativeArch()
+		if err != nil {
+			return err
+		}
+		arch = nativeArch
+	}
+
+	present := false
+	if retCode := C.seccomp_arch_exist(f.filterCtx, arch.toNative()); retCode == 0 {
+		present = true
+	} else if err := errRc(retCode); err != syscall.EEXIST {
+		return err
+	}
+	if !present && f.hasConditionalRules {
+		return fmt.Errorf(
+			"cannot add architecture %s after adding argument conditions; "+
+				"existing argument indices are bound to the original ABI set; "+
+				"build a separate single-architecture filter for %s with rewritten indices and merge the disjoint filters",
+			arch.String(), arch.String())
 	}
 
 	// Libseccomp returns -EEXIST if the specified architecture is already
@@ -1185,6 +1257,16 @@ func (f *ScmpFilter) AddRuleExact(call ScmpSyscall, action ScmpAction) error {
 // AddRuleConditional adds a single rule for a conditional action on a syscall.
 // Returns an error if an issue was encountered adding the rule.
 // All conditions must match for the rule to match.
+//
+// Argument indices are validated against the filter's architecture set. A
+// filter containing multiple ABIs cannot safely share one set of argument
+// indices: AddRuleConditional returns an error instead of applying the rule to
+// an ABI for which the index may mean a different parameter. Build one
+// single-architecture filter per ABI with rewritten indices and merge the
+// disjoint filters to deploy architecture-specific conditions together.
+// Conditions with a recorded ArgumentArch must match the sole architecture in
+// a single-architecture filter; a zero ArgumentArch is treated as a raw,
+// unchecked index for backward compatibility.
 func (f *ScmpFilter) AddRuleConditional(call ScmpSyscall, action ScmpAction, conds []ScmpCondition) error {
 	return f.addRuleGeneric(call, action, false, conds)
 }
@@ -1195,6 +1277,7 @@ func (f *ScmpFilter) AddRuleConditional(call ScmpSyscall, action ScmpAction, con
 // cannot be applied to the current architecture without modification.
 // The rule will function exactly as described, but it may not function identically
 // (or be able to be applied to) all architectures.
+// ABI validation for conditions is the same as in AddRuleConditional.
 // Returns an error if an issue was encountered adding the rule.
 func (f *ScmpFilter) AddRuleConditionalExact(call ScmpSyscall, action ScmpAction, conds []ScmpCondition) error {
 	return f.addRuleGeneric(call, action, true, conds)

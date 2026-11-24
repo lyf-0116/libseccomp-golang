@@ -6,6 +6,7 @@ package seccomp
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"syscall"
 )
 
@@ -330,6 +331,16 @@ func (f *ScmpFilter) addRuleGeneric(call ScmpSyscall, action ScmpAction, exact b
 		return errBadFilter
 	}
 
+	if len(conds) != 0 {
+		arches, err := f.getArches()
+		if err != nil {
+			return err
+		}
+		if err := validateConditionsForArches(conds, arches); err != nil {
+			return err
+		}
+	}
+
 	if len(conds) == 0 {
 		if err := f.addRuleWrapper(call, action, exact, 0, nil); err != nil {
 			return err
@@ -352,10 +363,128 @@ func (f *ScmpFilter) addRuleGeneric(call ScmpSyscall, action ScmpAction, exact b
 		}
 	}
 
+	if len(conds) != 0 {
+		f.hasConditionalRules = true
+	}
+
 	return nil
 }
 
 // Generic Helpers
+
+// supportedArches lists every concrete ScmpArch whose presence in a filter can
+// be queried. Keep it in sync with the ScmpArch constants.
+var supportedArches = []ScmpArch{
+	ArchX86,
+	ArchAMD64,
+	ArchX32,
+	ArchARM,
+	ArchARM64,
+	ArchMIPS,
+	ArchMIPS64,
+	ArchMIPS64N32,
+	ArchMIPSEL,
+	ArchMIPSEL64,
+	ArchMIPSEL64N32,
+	ArchPPC,
+	ArchPPC64,
+	ArchPPC64LE,
+	ArchS390,
+	ArchS390X,
+	ArchPARISC,
+	ArchPARISC64,
+	ArchRISCV64,
+	ArchLOONGARCH64,
+	ArchM68K,
+	ArchSH,
+	ArchSHEB,
+}
+
+// getArches returns the concrete architectures currently present in f.
+// DOES NOT LOCK OR CHECK VALIDITY: the caller must hold f.lock and have
+// checked f.valid.
+func (f *ScmpFilter) getArches() ([]ScmpArch, error) {
+	var arches []ScmpArch
+	for _, arch := range supportedArches {
+		nativeArch := arch.toNative()
+		if nativeArch == C.C_ARCH_BAD {
+			// Unsupported by the headers/libseccomp used at compile time.
+			continue
+		}
+
+		retCode := C.seccomp_arch_exist(f.filterCtx, nativeArch)
+		if retCode == 0 {
+			arches = append(arches, arch)
+			continue
+		}
+
+		err := errRc(retCode)
+		if err == syscall.EEXIST {
+			continue
+		}
+		if err == syscall.EINVAL {
+			// A newer arch token can be unknown to an older runtime
+			// libseccomp even when it was known at compile time.
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	return arches, nil
+}
+
+// validateConditionsForArches rejects argument indices whose ABI meaning is
+// not unambiguous for the filter's architecture set.
+func validateConditionsForArches(conds []ScmpCondition, arches []ScmpArch) error {
+	if len(arches) == 0 {
+		return errors.New("cannot add a conditional rule to a filter with no architectures")
+	}
+
+	if len(arches) > 1 {
+		if len(conds) == 0 {
+			return nil
+		}
+		names := make([]string, 0, len(arches))
+		for _, arch := range arches {
+			names = append(names, arch.String())
+		}
+		cond := conds[0]
+		return fmt.Errorf(
+			"argument %d comparison is ABI-specific and cannot be shared by a filter containing multiple architectures (%s); "+
+				"rewrite the index for one ABI and use a single-architecture filter, or add architecture-specific filters and merge them",
+			cond.Argument, strings.Join(names, ", "))
+	}
+
+	targetArch := arches[0]
+	for _, cond := range conds {
+		condArch := cond.ArgumentArch
+		if condArch == ArchInvalid {
+			// Direct struct literals and old serialized conditions do not
+			// carry metadata. Preserve their raw-index behavior.
+			continue
+		}
+		if condArch == ArchNative {
+			nativeArch, err := GetNativeArch()
+			if err != nil {
+				return err
+			}
+			condArch = nativeArch
+		}
+		if err := sanitizeArch(condArch); err != nil {
+			return fmt.Errorf("condition on argument %d has invalid ABI marker: %w",
+				cond.Argument, err)
+		}
+		if condArch != targetArch {
+			return fmt.Errorf(
+				"condition on argument %d uses argument indices for ABI %s but filter's only architecture is %s; "+
+					"rewrite the argument index for %s and mark the condition with that ABI",
+				cond.Argument, condArch.String(), targetArch.String(), targetArch.String())
+		}
+	}
+
+	return nil
+}
 
 // Helper - Sanitize Arch token input
 func sanitizeArch(in ScmpArch) error {

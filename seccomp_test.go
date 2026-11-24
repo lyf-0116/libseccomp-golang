@@ -4,6 +4,7 @@ package seccomp
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -255,6 +256,306 @@ func TestMakeCondition(t *testing.T) {
 	_, err = MakeCondition(3, CompareMaskedEqual)
 	if err == nil {
 		t.Errorf("MakeCondition with no arguments should fail")
+	}
+}
+
+func TestMakeConditionRecordsABI(t *testing.T) {
+	nativeArch, err := GetNativeArch()
+	if err != nil {
+		t.Fatalf("GetNativeArch: %v", err)
+	}
+
+	condition, err := MakeCondition(3, CompareNotEqual, 0x10)
+	if err != nil {
+		t.Fatalf("MakeCondition: %v", err)
+	}
+	if condition.ArgumentArch != nativeArch {
+		t.Fatalf("MakeCondition ABI = %s, want %s",
+			condition.ArgumentArch, nativeArch)
+	}
+
+	condition, err = MakeConditionForArch(2, ArchX86, CompareEqual, 0x10)
+	if err != nil {
+		t.Fatalf("MakeConditionForArch: %v", err)
+	}
+	if condition.Argument != 2 || condition.ArgumentArch != ArchX86 {
+		t.Fatalf("architecture-specific condition filled incorrectly: %+v", condition)
+	}
+
+	encoded, err := json.Marshal(condition)
+	if err != nil {
+		t.Fatalf("json.Marshal condition: %v", err)
+	}
+	var decoded ScmpCondition
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal condition: %v", err)
+	}
+	if decoded.ArgumentArch != ArchX86 {
+		t.Fatalf("decoded ABI marker = %s, want %s", decoded.ArgumentArch, ArchX86)
+	}
+
+	var legacy ScmpCondition
+	if err := json.Unmarshal([]byte(`{"argument":1,"operator":4,"operand_one":1}`), &legacy); err != nil {
+		t.Fatalf("json.Unmarshal legacy condition: %v", err)
+	}
+	if legacy.ArgumentArch != ArchInvalid {
+		t.Fatalf("legacy condition ABI = %s, want invalid/unmarked", legacy.ArgumentArch)
+	}
+
+	condition, err = MakeConditionForArch(0, ArchNative, CompareEqual, 0x10)
+	if err != nil {
+		t.Fatalf("MakeConditionForArch(ArchNative): %v", err)
+	}
+	if condition.ArgumentArch != nativeArch {
+		t.Fatalf("ArchNative marker = %s, want %s",
+			condition.ArgumentArch, nativeArch)
+	}
+
+	if _, err := MakeConditionForArch(0, ArchInvalid, CompareEqual, 0x10); err == nil {
+		t.Fatal("MakeConditionForArch with invalid architecture should fail")
+	}
+	if _, err := MakeConditionForArch(6, ArchX86, CompareEqual, 0x10); err == nil {
+		t.Fatal("MakeConditionForArch with argument index 6 should fail")
+	}
+}
+
+func addForeignArchForTest(t *testing.T, filter *ScmpFilter) ScmpArch {
+	t.Helper()
+
+	nativeArch, err := GetNativeArch()
+	if err != nil {
+		t.Fatalf("GetNativeArch: %v", err)
+	}
+
+	for _, arch := range []ScmpArch{ArchX86, ArchAMD64, ArchARM64, ArchARM, ArchPPC64LE, ArchS390X} {
+		if arch == nativeArch {
+			continue
+		}
+		if err := filter.AddArch(arch); err == nil {
+			return arch
+		}
+	}
+
+	t.Skip("no supported foreign architecture is available")
+	return ArchInvalid
+}
+
+func TestAddRuleConditionalArchValidation(t *testing.T) {
+	nativeArch, err := GetNativeArch()
+	if err != nil {
+		t.Fatalf("GetNativeArch: %v", err)
+	}
+
+	multiArchFilter, err := NewFilter(ActAllow)
+	if err != nil {
+		t.Fatalf("NewFilter: %v", err)
+	}
+	defer multiArchFilter.Release()
+
+	foreignArch := addForeignArchForTest(t, multiArchFilter)
+	nativeCondition, err := MakeCondition(0, CompareEqual, 0x1234)
+	if err != nil {
+		t.Fatalf("MakeCondition: %v", err)
+	}
+	foreignCondition, err := MakeConditionForArch(1, foreignArch, CompareEqual, 0x1234)
+	if err != nil {
+		t.Fatalf("MakeConditionForArch: %v", err)
+	}
+
+	err = multiArchFilter.AddRuleConditional(ScmpSyscall(1), ActErrno.SetReturnCode(int16(syscall.EPERM)),
+		[]ScmpCondition{nativeCondition})
+	if err == nil || !strings.Contains(err.Error(), "multiple architectures") {
+		t.Fatalf("multi-architecture conditional rule error = %v, want multiple architectures error", err)
+	}
+
+	err = multiArchFilter.AddRuleConditional(ScmpSyscall(1), ActErrno.SetReturnCode(int16(syscall.EPERM)),
+		[]ScmpCondition{foreignCondition})
+	if err == nil || !strings.Contains(err.Error(), "multiple architectures") {
+		t.Fatalf("marked multi-architecture conditional rule error = %v, want multiple architectures error", err)
+	}
+
+	foreignOnlyFilter, err := NewFilter(ActAllow)
+	if err != nil {
+		t.Fatalf("NewFilter foreign-only: %v", err)
+	}
+	defer foreignOnlyFilter.Release()
+
+	foreignArch = addForeignArchForTest(t, foreignOnlyFilter)
+	if err := foreignOnlyFilter.RemoveArch(nativeArch); err != nil {
+		t.Fatalf("RemoveArch(native): %v", err)
+	}
+
+	nativeCall, err := GetSyscallFromNameByArch("getpid", nativeArch)
+	if err != nil {
+		t.Fatalf("getpid is unavailable on native ABI %s: %v", nativeArch, err)
+	}
+
+	err = foreignOnlyFilter.AddRuleConditional(nativeCall, ActErrno.SetReturnCode(int16(syscall.EPERM)),
+		[]ScmpCondition{nativeCondition})
+	if err == nil {
+		t.Fatal("native-ABI condition on foreign-only filter should fail")
+	}
+	if !strings.Contains(err.Error(), nativeArch.String()) ||
+		!strings.Contains(err.Error(), foreignArch.String()) {
+		t.Fatalf("ABI mismatch error %q should name %s and %s",
+			err, nativeArch, foreignArch)
+	}
+
+	rawCondition := ScmpCondition{
+		Argument: 0,
+		Op:       CompareEqual,
+		Operand1: 0x1234,
+	}
+	if err := foreignOnlyFilter.AddRuleConditional(nativeCall,
+		ActErrno.SetReturnCode(int16(syscall.EINVAL)),
+		[]ScmpCondition{rawCondition}); err != nil {
+		t.Fatalf("unmarked raw condition should retain legacy behavior: %v", err)
+	}
+
+	if err := foreignOnlyFilter.AddRuleConditionalExact(nativeCall,
+		ActErrno.SetReturnCode(int16(syscall.EACCES)),
+		[]ScmpCondition{foreignCondition}); err != nil {
+		t.Fatalf("condition marked with filter ABI should be accepted: %v", err)
+	}
+}
+
+func TestAddArchAfterConditionalRuleRejected(t *testing.T) {
+	nativeArch, err := GetNativeArch()
+	if err != nil {
+		t.Fatalf("GetNativeArch: %v", err)
+	}
+
+	probe, err := NewFilter(ActAllow)
+	if err != nil {
+		t.Fatalf("NewFilter probe: %v", err)
+	}
+	defer probe.Release()
+	foreignArch := addForeignArchForTest(t, probe)
+
+	filter, err := NewFilter(ActAllow)
+	if err != nil {
+		t.Fatalf("NewFilter: %v", err)
+	}
+	defer filter.Release()
+
+	call, err := GetSyscallFromNameByArch("getpid", nativeArch)
+	if err != nil {
+		t.Fatalf("getpid: %v", err)
+	}
+	condition, err := MakeCondition(0, CompareEqual, 0x1234)
+	if err != nil {
+		t.Fatalf("MakeCondition: %v", err)
+	}
+	if err := filter.AddRuleConditional(call, ActErrno.SetReturnCode(int16(syscall.EPERM)),
+		[]ScmpCondition{condition}); err != nil {
+		t.Fatalf("AddRuleConditional: %v", err)
+	}
+
+	err = filter.AddArch(foreignArch)
+	if err == nil || !strings.Contains(err.Error(), "after adding argument conditions") {
+		t.Fatalf("AddArch after conditions error = %v, want conditional-rule guard", err)
+	}
+	present, err := filter.IsArchPresent(foreignArch)
+	if err != nil {
+		t.Fatalf("IsArchPresent foreign: %v", err)
+	}
+	if present {
+		t.Fatal("foreign architecture should not be present after rejected AddArch")
+	}
+
+	if err := filter.AddArch(nativeArch); err != nil {
+		t.Fatalf("re-adding the existing native architecture should succeed: %v", err)
+	}
+
+	if err := filter.Reset(ActAllow); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	if err := filter.AddArch(foreignArch); err != nil {
+		t.Fatalf("AddArch after Reset should succeed: %v", err)
+	}
+}
+
+func TestConditionalRulesExpandedPerArchitectureMerge(t *testing.T) {
+	nativeArch, err := GetNativeArch()
+	if err != nil {
+		t.Fatalf("GetNativeArch: %v", err)
+	}
+
+	nativeFilter, err := NewFilter(ActAllow)
+	if err != nil {
+		t.Fatalf("NewFilter native: %v", err)
+	}
+	defer nativeFilter.Release()
+
+	foreignFilter, err := NewFilter(ActAllow)
+	if err != nil {
+		t.Fatalf("NewFilter foreign: %v", err)
+	}
+	defer foreignFilter.Release()
+
+	foreignArch := addForeignArchForTest(t, foreignFilter)
+	if err := foreignFilter.RemoveArch(nativeArch); err != nil {
+		t.Fatalf("RemoveArch(native): %v", err)
+	}
+
+	nativeCall, err := GetSyscallFromNameByArch("getpid", nativeArch)
+	if err != nil {
+		t.Fatalf("getpid on native architecture: %v", err)
+	}
+
+	nativeCondition, err := MakeCondition(0, CompareEqual, 0x1234)
+	if err != nil {
+		t.Fatalf("MakeCondition native: %v", err)
+	}
+	foreignCondition, err := MakeConditionForArch(1, foreignArch, CompareEqual, 0x1234)
+	if err != nil {
+		t.Fatalf("MakeConditionForArch foreign: %v", err)
+	}
+
+	if err := nativeFilter.AddRuleConditional(nativeCall, ActErrno.SetReturnCode(int16(syscall.EPERM)),
+		[]ScmpCondition{nativeCondition}); err != nil {
+		t.Fatalf("AddRuleConditional native: %v", err)
+	}
+	if err := foreignFilter.AddRuleConditional(nativeCall, ActErrno.SetReturnCode(int16(syscall.EPERM)),
+		[]ScmpCondition{foreignCondition}); err != nil {
+		t.Fatalf("AddRuleConditional foreign: %v", err)
+	}
+
+	if err := nativeFilter.Merge(foreignFilter); err != nil {
+		t.Fatalf("merging per-ABI filters: %v", err)
+	}
+
+	exportFile, err := os.CreateTemp(t.TempDir(), "merged-*.bpf")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	defer exportFile.Close()
+
+	if err := nativeFilter.ExportBPF(exportFile); err != nil {
+		t.Fatalf("ExportBPF: %v", err)
+	}
+	info, err := exportFile.Stat()
+	if err != nil {
+		t.Fatalf("Stat exported BPF: %v", err)
+	}
+	if info.Size() == 0 {
+		t.Fatal("exported merged filter is empty")
+	}
+
+	pfcFile, err := os.CreateTemp(t.TempDir(), "merged-*.pfc")
+	if err != nil {
+		t.Fatalf("CreateTemp PFC: %v", err)
+	}
+	defer pfcFile.Close()
+	if err := nativeFilter.ExportPFC(pfcFile); err != nil {
+		t.Fatalf("ExportPFC: %v", err)
+	}
+	pfc, err := os.ReadFile(pfcFile.Name())
+	if err != nil {
+		t.Fatalf("Read PFC: %v", err)
+	}
+	if !bytes.Contains(pfc, []byte("$a0")) || !bytes.Contains(pfc, []byte("$a1")) {
+		t.Fatalf("merged PFC does not contain both ABI-specific argument indices:\n%s", pfc)
 	}
 }
 
