@@ -621,6 +621,16 @@ type ScmpFilter struct {
 	filterCtx C.scmp_filter_ctx
 	valid     bool
 	lock      sync.Mutex
+
+	// rules records the rules added through this package, grouped by the
+	// architectures they apply to. libseccomp does not expose its rule
+	// database, so this is needed to export a filter without losing the
+	// architecture each rule belongs to.
+	rules map[ScmpArch][]filterRule
+	// txRules is a snapshot of rules taken by TransactionStart.
+	txRules map[ScmpArch][]filterRule
+	// txActive reports whether txRules is a live transaction snapshot.
+	txActive bool
 }
 
 // NewFilter creates and returns a new filter context.  Accepts a default action to be
@@ -683,6 +693,8 @@ func (f *ScmpFilter) Reset(defaultAction ScmpAction) error {
 		return errRc(retCode)
 	}
 
+	f.rules = nil
+
 	return nil
 }
 
@@ -701,7 +713,11 @@ func (f *ScmpFilter) Release() {
 	}
 
 	f.valid = false
+	f.rules = nil
+	f.txRules = nil
+	f.txActive = false
 	C.seccomp_release(f.filterCtx)
+	f.filterCtx = nil
 }
 
 // Merge merges two filter contexts.
@@ -734,7 +750,11 @@ func (f *ScmpFilter) Merge(src *ScmpFilter) error {
 		return e
 	}
 
+	f.mergeRules(src)
 	src.valid = false
+	src.filterCtx = nil
+	src.rules = nil
+	src.txRules = nil
 
 	return nil
 }
@@ -795,6 +815,8 @@ func (f *ScmpFilter) AddArch(arch ScmpArch) error {
 		}
 	}
 
+	f.ensureRuleArch(arch)
+
 	return nil
 }
 
@@ -820,6 +842,8 @@ func (f *ScmpFilter) RemoveArch(arch ScmpArch) error {
 			return e
 		}
 	}
+
+	delete(f.rules, arch)
 
 	return nil
 }
@@ -1223,6 +1247,9 @@ func (f *ScmpFilter) ExportPFC(file *os.File) error {
 
 // ExportBPF outputs Berkeley Packet Filter-formatted, kernel-readable dump of a
 // filter context's rules to a file.
+// The output does not contain architecture metadata and can not be restored
+// with [ImportFilter]; use [ScmpFilter.Export] when the filter needs to be
+// imported later.
 // Accepts file to write to (must be open for writing).
 // Returns an error if writing to the file fails.
 func (f *ScmpFilter) ExportBPF(file *os.File) error {
@@ -1244,6 +1271,8 @@ func (f *ScmpFilter) ExportBPF(file *os.File) error {
 
 // ExportBPFMem is similar to [ExportBPF], except the data is written into
 // a memory and returned as []byte.
+// The returned data is raw BPF and is rejected by [ImportFilter]; use
+// [ScmpFilter.Export] for a self-describing, importable representation.
 func (f *ScmpFilter) ExportBPFMem() ([]byte, error) {
 	f.lock.Lock()
 	defer f.lock.Unlock()
@@ -1326,6 +1355,9 @@ func (f *ScmpFilter) TransactionStart() error {
 		return errRc(retCode)
 	}
 
+	f.txRules = cloneRuleMap(f.rules)
+	f.txActive = true
+
 	return nil
 }
 
@@ -1343,6 +1375,11 @@ func (f *ScmpFilter) TransactionReject() {
 	}
 
 	C.compat_transaction_reject(f.filterCtx)
+	if f.txActive {
+		f.rules = f.txRules
+		f.txRules = nil
+		f.txActive = false
+	}
 }
 
 // TransactionCommit commits a transaction started by [TransactionStart].
@@ -1361,6 +1398,9 @@ func (f *ScmpFilter) TransactionCommit() error {
 	if retCode := C.compat_transaction_commit(f.filterCtx); retCode < 0 {
 		return errRc(retCode)
 	}
+
+	f.txRules = nil
+	f.txActive = false
 
 	return nil
 }

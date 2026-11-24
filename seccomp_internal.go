@@ -252,6 +252,146 @@ func errRc(rc C.int) error {
 	return syscall.Errno(-1 * rc)
 }
 
+// supportedArches lists every architecture known to this package. It is used
+// both for enumerating the architectures present in a filter and for
+// resolving the architecture identifiers stored in exported filters.
+var supportedArches = []ScmpArch{
+	ArchX86,
+	ArchAMD64,
+	ArchX32,
+	ArchARM,
+	ArchARM64,
+	ArchMIPS,
+	ArchMIPS64,
+	ArchMIPS64N32,
+	ArchMIPSEL,
+	ArchMIPSEL64,
+	ArchMIPSEL64N32,
+	ArchPPC,
+	ArchPPC64,
+	ArchPPC64LE,
+	ArchS390,
+	ArchS390X,
+	ArchPARISC,
+	ArchPARISC64,
+	ArchRISCV64,
+	ArchLOONGARCH64,
+	ArchM68K,
+	ArchSH,
+	ArchSHEB,
+}
+
+// getArchesLocked returns the architectures currently present in the filter.
+// Architectures not supported by the libseccomp version in use are skipped.
+//
+// DOES NOT LOCK OR CHECK VALIDITY
+// Assumes caller has already done this.
+func (f *ScmpFilter) getArchesLocked() ([]ScmpArch, error) {
+	var arches []ScmpArch
+	for _, arch := range supportedArches {
+		nativeArch := arch.toNative()
+		if nativeArch == C.C_ARCH_BAD {
+			continue
+		}
+		if retCode := C.seccomp_arch_exist(f.filterCtx, nativeArch); retCode == 0 {
+			arches = append(arches, arch)
+		} else if e := errRc(retCode); e != syscall.EEXIST {
+			return nil, e
+		}
+	}
+	return arches, nil
+}
+
+// archFromExportID converts an architecture identifier used in an exported
+// filter into an ScmpArch.
+func archFromExportID(id uint32) (ScmpArch, error) {
+	return archFromNative(C.uint32_t(id))
+}
+
+// exportID returns the stable architecture identifier used in exported
+// filters.
+func (a ScmpArch) exportID() uint32 {
+	return uint32(a.toNative())
+}
+
+// replaceFilterCtx replaces the state of f with the state of src, releasing
+// the old filter context. src is invalidated and must not be used afterwards.
+func (f *ScmpFilter) replaceFilterCtx(src *ScmpFilter) error {
+	f.lock.Lock()
+	defer f.lock.Unlock()
+
+	if !f.valid {
+		return errBadFilter
+	}
+
+	C.seccomp_release(f.filterCtx)
+	f.filterCtx = src.filterCtx
+	f.rules = src.rules
+	f.txRules = src.txRules
+	f.txActive = src.txActive
+
+	src.valid = false
+	src.filterCtx = nil
+	src.rules = nil
+	src.txRules = nil
+	src.txActive = false
+
+	return nil
+}
+
+// snapshotExportAttrsLocked returns the filter attributes that are preserved
+// across an export/import round trip.
+//
+// DOES NOT LOCK OR CHECK VALIDITY
+// Assumes caller has already done this.
+func (f *ScmpFilter) snapshotExportAttrsLocked() (filterExportAttrs, error) {
+	var attrs filterExportAttrs
+
+	var defaultAction C.uint32_t
+	if retCode := C.seccomp_attr_get(f.filterCtx, filterAttrActDefault.toNative(), &defaultAction); retCode != 0 {
+		return attrs, errRc(retCode)
+	}
+	action, err := actionFromNative(defaultAction)
+	if err != nil {
+		return attrs, err
+	}
+	attrs.defaultAction = action
+
+	var badArchAction C.uint32_t
+	if retCode := C.seccomp_attr_get(f.filterCtx, filterAttrActBadArch.toNative(), &badArchAction); retCode != 0 {
+		return attrs, errRc(retCode)
+	}
+	action, err = actionFromNative(badArchAction)
+	if err != nil {
+		return attrs, err
+	}
+	attrs.badArchAction = action
+
+	getBool := func(attr scmpFilterAttr, bit uint32) {
+		var value C.uint32_t
+		if retCode := C.seccomp_attr_get(f.filterCtx, attr.toNative(), &value); retCode != 0 {
+			return
+		}
+		attrs.attrMask |= bit
+		if value != 0 {
+			attrs.attrValueMask |= bit
+		}
+	}
+	getBool(filterAttrNNP, filterExportAttrNNP)
+	getBool(filterAttrLog, filterExportAttrLog)
+	getBool(filterAttrSSB, filterExportAttrSSB)
+	getBool(filterAttrRawRC, filterExportAttrRawRC)
+	getBool(filterAttrWaitKill, filterExportAttrWaitKill)
+
+	var optimize C.uint32_t
+	if retCode := C.seccomp_attr_get(f.filterCtx, filterAttrOptimize.toNative(), &optimize); retCode == 0 {
+		attrs.attrMask |= filterExportAttrOptimize
+		attrs.optimize = int32(optimize)
+	}
+
+	return attrs, nil
+}
+
 // Get a raw filter attribute
 func (f *ScmpFilter) getFilterAttr(attr scmpFilterAttr) (C.uint32_t, error) {
 	f.lock.Lock()
@@ -351,6 +491,8 @@ func (f *ScmpFilter) addRuleGeneric(call ScmpSyscall, action ScmpAction, exact b
 			return err
 		}
 	}
+
+	f.recordRule(call, action, exact, conds)
 
 	return nil
 }
