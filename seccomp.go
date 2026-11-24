@@ -712,9 +712,22 @@ func (f *ScmpFilter) Release() {
 // must match.
 // The filter src will be merged into the filter this is called on.
 // The architectures of the src filter not present in the destination, and all
-// associated rules, will be added to the destination.
+// associated rules, will be added to the destination. Rules always stay
+// attached to the architecture (ABI) they were added for: since syscall
+// numbers differ between ABIs, merging remaps each rule set together with
+// its architecture rather than renumbering or re-targeting rules across
+// architectures, so a rule written for one ABI can never silently match, or
+// miss, a syscall of another ABI after the merge.
+// If the two filters share an architecture - most commonly the native
+// (default) architecture every new filter starts with - Merge fails and
+// reports the conflicting architecture instead of silently keeping only one
+// of the two rule sets.
 // Returns an error if merging the filters failed.
 func (f *ScmpFilter) Merge(src *ScmpFilter) error {
+	if src == nil || src == f {
+		return errors.New("cannot merge a filter context with itself")
+	}
+
 	f.lock.Lock()
 	defer f.lock.Unlock()
 
@@ -723,6 +736,23 @@ func (f *ScmpFilter) Merge(src *ScmpFilter) error {
 
 	if !src.valid || !f.valid {
 		return errors.New("one or more of the filter contexts is invalid or uninitialized")
+	}
+
+	// Check for architectures shared by both filters up front, so that a
+	// conflict is reported explicitly instead of surfacing as a generic
+	// library error.
+	srcArches, err := src.getArches()
+	if err != nil {
+		return fmt.Errorf("could not determine the architectures of the source filter: %w", err)
+	}
+	for _, arch := range srcArches {
+		present, err := f.archPresent(arch)
+		if err != nil {
+			return err
+		}
+		if present {
+			return fmt.Errorf("cannot merge filters: architecture %s is present in both filters", arch)
+		}
 	}
 
 	// Merge the filters
@@ -760,6 +790,14 @@ func (f *ScmpFilter) IsArchPresent(arch ScmpArch) (bool, error) {
 		return false, errBadFilter
 	}
 
+	return f.archPresent(arch)
+}
+
+// archPresent reports whether the given architecture is present in the
+// filter.
+// DOES NOT LOCK OR CHECK VALIDITY
+// Assumes caller has already done this, and sanitized the architecture
+func (f *ScmpFilter) archPresent(arch ScmpArch) (bool, error) {
 	if retCode := C.seccomp_arch_exist(f.filterCtx, arch.toNative()); retCode != 0 {
 		e := errRc(retCode)
 		if e == syscall.EEXIST {
@@ -1165,6 +1203,12 @@ func (f *ScmpFilter) SetSyscallPriority(call ScmpSyscall, priority uint8) error 
 // AddRule adds a single rule for an unconditional action on a syscall.
 // Accepts the number of the syscall and the action to be taken on the call
 // being made.
+// Syscall numbers are architecture specific: if the filter's only
+// architecture is a foreign (non-native) one, the number is interpreted
+// against that architecture's ABI, so a number obtained from
+// GetSyscallFromNameByArch for that architecture matches the same syscall
+// after the rule is added. In all other cases the number is interpreted
+// against the native architecture, as libseccomp does.
 // Returns an error if an issue was encountered adding the rule.
 func (f *ScmpFilter) AddRule(call ScmpSyscall, action ScmpAction) error {
 	return f.addRuleGeneric(call, action, false, nil)

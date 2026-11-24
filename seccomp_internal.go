@@ -296,6 +296,14 @@ func (f *ScmpFilter) addRuleWrapper(call ScmpSyscall, action ScmpAction, exact b
 		return errors.New("null conditions list, but length is nonzero")
 	}
 
+	// libseccomp interprets plain syscall numbers against the native
+	// architecture; rewrite the number first so the rule matches the
+	// syscall the caller resolved it for on the filter's architecture.
+	call, err := f.translateSyscallToNative(call)
+	if err != nil {
+		return err
+	}
+
 	var retCode C.int
 	if exact {
 		retCode = C.seccomp_rule_add_exact_array(f.filterCtx, action.toNative(), C.int(call), length, cond)
@@ -356,6 +364,118 @@ func (f *ScmpFilter) addRuleGeneric(call ScmpSyscall, action ScmpAction, exact b
 }
 
 // Generic Helpers
+
+// supportedArches lists every architecture known to this package, i.e. all
+// the ABIs that filter rules can be written for. It is used to enumerate
+// the architectures present in a filter, so it must cover every ScmpArch
+// constant: an architecture missing from this list would go undetected when
+// merging filters, and rules written for it could silently end up governed
+// by the filter's default action on that machine.
+var supportedArches = []ScmpArch{
+	ArchX86,
+	ArchAMD64,
+	ArchX32,
+	ArchARM,
+	ArchARM64,
+	ArchMIPS,
+	ArchMIPS64,
+	ArchMIPS64N32,
+	ArchMIPSEL,
+	ArchMIPSEL64,
+	ArchMIPSEL64N32,
+	ArchPPC,
+	ArchPPC64,
+	ArchPPC64LE,
+	ArchS390,
+	ArchS390X,
+	ArchPARISC,
+	ArchPARISC64,
+	ArchRISCV64,
+	ArchLOONGARCH64,
+	ArchM68K,
+	ArchSH,
+	ArchSHEB,
+}
+
+// getArches returns the architectures currently present in the filter.
+// Architectures not supported by the libseccomp version in use are skipped.
+// DOES NOT LOCK OR CHECK VALIDITY
+// Assumes caller has already done this
+func (f *ScmpFilter) getArches() ([]ScmpArch, error) {
+	var arches []ScmpArch
+	for _, arch := range supportedArches {
+		nativeArch := arch.toNative()
+		if nativeArch == C.C_ARCH_BAD {
+			// Not supported by this version of libseccomp
+			continue
+		}
+		if retCode := C.seccomp_arch_exist(f.filterCtx, nativeArch); retCode == 0 {
+			arches = append(arches, arch)
+		} else if e := errRc(retCode); e != syscall.EEXIST {
+			// -EEXIST is "arch not present"
+			return nil, e
+		}
+	}
+	return arches, nil
+}
+
+// translateSyscallToNative rewrites a rule's syscall number so it can be
+// handed to libseccomp, which interprets plain syscall numbers against the
+// native (default) architecture before mapping them onto each of the
+// filter's architectures. If the filter's only architecture is a foreign
+// (non-native) one, a plain number can only sensibly belong to that
+// architecture's ABI - it is the only architecture rules can be written
+// for - so translate it to the equivalent native number (or pseudo number)
+// first, letting libseccomp map it back onto the filter's architecture.
+// Without this, a rule written for the foreign ABI silently ends up
+// matching a different syscall, or no syscall at all, once the number is
+// re-mapped through the native architecture, and a syscall the rule was
+// supposed to catch is governed by the filter's default action instead.
+// Numbers for filters containing the native architecture or multiple
+// architectures, as well as pseudo (negative) syscall numbers, are already
+// interpreted correctly by libseccomp and are returned unchanged.
+// DOES NOT LOCK OR CHECK VALIDITY
+// Assumes caller has already done this
+func (f *ScmpFilter) translateSyscallToNative(call ScmpSyscall) (ScmpSyscall, error) {
+	if call < 0 {
+		// Pseudo syscall numbers are architecture independent
+		return call, nil
+	}
+
+	nativeArch, err := GetNativeArch()
+	if err != nil {
+		return 0, err
+	}
+	// Filters containing the native architecture interpret numbers
+	// against it already, no translation needed.
+	if present, err := f.archPresent(nativeArch); err != nil {
+		return 0, err
+	} else if present {
+		return call, nil
+	}
+
+	arches, err := f.getArches()
+	if err != nil {
+		return 0, err
+	}
+	if len(arches) != 1 {
+		return call, nil
+	}
+
+	// Resolve the number to a name using the filter's architecture, then
+	// resolve the name back to the native architecture's number (or a
+	// pseudo number if the syscall does not exist natively).
+	name, err := call.GetNameByArch(arches[0])
+	if err != nil {
+		return 0, fmt.Errorf("unrecognized syscall %#x on architecture %s", int32(call), arches[0])
+	}
+	nativeCall, err := GetSyscallFromNameByArch(name, ArchNative)
+	if err != nil {
+		return 0, err
+	}
+
+	return nativeCall, nil
+}
 
 // Helper - Sanitize Arch token input
 func sanitizeArch(in ScmpArch) error {

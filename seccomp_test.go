@@ -579,6 +579,218 @@ func TestMergeFilters(t *testing.T) {
 	}
 }
 
+// exportedFilterMatchesSyscall exports the filter as a BPF program and
+// reports whether any of its instructions compares against the given
+// syscall number.
+func exportedFilterMatchesSyscall(t *testing.T, filter *ScmpFilter, call ScmpSyscall) bool {
+	t.Helper()
+
+	file, err := os.Create(t.TempDir() + "/bpf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if err := filter.ExportBPF(file); err != nil {
+		t.Fatalf("Error exporting filter: %s", err)
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	bpf, err := io.ReadAll(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type sockFilter struct {
+		code uint16
+		jt   uint8
+		jf   uint8
+		k    uint32
+	}
+	if len(bpf)%int(unsafe.Sizeof(sockFilter{})) != 0 {
+		t.Fatalf("Exported BPF program has odd size %d", len(bpf))
+	}
+	insns := unsafe.Slice((*sockFilter)(unsafe.Pointer(&bpf[0])),
+		len(bpf)/int(unsafe.Sizeof(sockFilter{})))
+	for _, insn := range insns {
+		if ScmpSyscall(insn.k) == call {
+			return true
+		}
+	}
+	return false
+}
+
+func TestMergeFiltersArchConflict(t *testing.T) {
+	nativeArch, err := GetNativeArch()
+	if err != nil {
+		t.Fatalf("Error getting native arch: %s", err)
+	}
+
+	filter1, err := NewFilter(ActAllow)
+	if err != nil {
+		t.Fatalf("Error creating filter: %s", err)
+	}
+	defer filter1.Release()
+
+	// Merging a filter into itself must fail rather than deadlock or
+	// corrupt the filter.
+	if err := filter1.Merge(filter1); err == nil {
+		t.Errorf("Merging a filter with itself should fail")
+	}
+
+	// Both filters contain the native (default) architecture, so the
+	// merge must fail explicitly instead of silently keeping only one of
+	// the two rule sets.
+	filter2, err := NewFilter(ActAllow)
+	if err != nil {
+		t.Fatalf("Error creating filter: %s", err)
+	}
+	defer filter2.Release()
+
+	err = filter1.Merge(filter2)
+	if err == nil {
+		t.Errorf("Merging filters sharing the native architecture should fail")
+	} else if !strings.Contains(err.Error(), nativeArch.String()) {
+		t.Errorf("Merge error should name the conflicting architecture %s, got: %s",
+			nativeArch.String(), err)
+	}
+
+	// A failed merge must leave the source filter valid and usable.
+	if !filter2.IsValid() {
+		t.Errorf("Source filter should remain valid after a failed merge")
+	}
+}
+
+func TestMergeFiltersMultiArch(t *testing.T) {
+	nativeArch, err := GetNativeArch()
+	if err != nil {
+		t.Fatalf("Error getting native arch: %s", err)
+	}
+
+	// Use a foreign architecture whose syscall numbers differ from the
+	// native ones, so that rules carried over by the merge would be
+	// visibly wrong if they were renumbered or re-targeted to another
+	// architecture.
+	foreignArch := ArchARM64
+	if nativeArch == ArchARM64 {
+		foreignArch = ArchAMD64
+	}
+
+	// The same syscall has different numbers on different ABIs.
+	nativeCall, err := GetSyscallFromNameByArch("getpid", nativeArch)
+	if err != nil {
+		t.Fatalf("Error getting getpid for arch %s: %s", nativeArch.String(), err)
+	}
+	foreignCall, err := GetSyscallFromNameByArch("getpid", foreignArch)
+	if err != nil {
+		t.Fatalf("Error getting getpid for arch %s: %s", foreignArch.String(), err)
+	}
+	if nativeCall == foreignCall {
+		t.Skipf("getpid has the same number on %s and %s",
+			nativeArch.String(), foreignArch.String())
+	}
+
+	// One rule set per architecture, each written with the syscall
+	// numbers of its own ABI.
+	filter1, err := NewFilter(ActErrno)
+	if err != nil {
+		t.Fatalf("Error creating filter: %s", err)
+	}
+	defer filter1.Release()
+	if err := filter1.AddRule(nativeCall, ActAllow); err != nil {
+		t.Fatalf("Error adding rule for arch %s: %s", nativeArch.String(), err)
+	}
+
+	filter2, err := NewFilter(ActErrno)
+	if err != nil {
+		t.Fatalf("Error creating filter: %s", err)
+	}
+	if err := filter2.AddArch(foreignArch); err != nil {
+		t.Fatalf("Error adding arch %s to filter: %s", foreignArch.String(), err)
+	}
+	if err := filter2.RemoveArch(nativeArch); err != nil {
+		t.Fatalf("Error removing native arch from filter: %s", err)
+	}
+	if err := filter2.AddRule(foreignCall, ActAllow); err != nil {
+		t.Fatalf("Error adding rule for arch %s: %s", foreignArch.String(), err)
+	}
+
+	if err := filter1.Merge(filter2); err != nil {
+		t.Fatalf("Error merging multi-arch filters: %s", err)
+	}
+	if filter2.IsValid() {
+		t.Errorf("Source filter should not be valid after merging")
+	}
+
+	// The merged filter must contain both architectures.
+	for _, arch := range []ScmpArch{nativeArch, foreignArch} {
+		present, err := filter1.IsArchPresent(arch)
+		if err != nil {
+			t.Fatalf("Error checking arch %s in merged filter: %s", arch.String(), err)
+		}
+		if !present {
+			t.Errorf("Merged filter does not contain architecture %s", arch.String())
+		}
+	}
+
+	// Each architecture's rules must keep the syscall number of the ABI
+	// they were written for: scan the exported BPF program for the jump
+	// immediates comparing the syscall number.
+	for _, call := range []ScmpSyscall{nativeCall, foreignCall} {
+		if !exportedFilterMatchesSyscall(t, filter1, call) {
+			t.Errorf("Exported merged filter does not match syscall %d of its own architecture", int(call))
+		}
+	}
+}
+
+func TestAddRuleForeignArch(t *testing.T) {
+	nativeArch, err := GetNativeArch()
+	if err != nil {
+		t.Fatalf("Error getting native arch: %s", err)
+	}
+
+	// Use a foreign architecture whose syscall numbers differ from the
+	// native ones.
+	foreignArch := ArchARM64
+	if nativeArch == ArchARM64 {
+		foreignArch = ArchAMD64
+	}
+
+	call, err := GetSyscallFromNameByArch("getpid", foreignArch)
+	if err != nil {
+		t.Fatalf("Error getting getpid for arch %s: %s", foreignArch.String(), err)
+	}
+
+	filter, err := NewFilter(ActErrno)
+	if err != nil {
+		t.Fatalf("Error creating filter: %s", err)
+	}
+	defer filter.Release()
+	if err := filter.AddArch(foreignArch); err != nil {
+		t.Fatalf("Error adding arch %s to filter: %s", foreignArch.String(), err)
+	}
+	if err := filter.RemoveArch(nativeArch); err != nil {
+		t.Fatalf("Error removing native arch from filter: %s", err)
+	}
+
+	// A rule written with the foreign architecture's syscall number must
+	// match that same number once the filter is exported, not whatever
+	// syscall the number happens to mean on the native architecture.
+	if err := filter.AddRule(call, ActAllow); err != nil {
+		t.Fatalf("Error adding rule for arch %s: %s", foreignArch.String(), err)
+	}
+	if !exportedFilterMatchesSyscall(t, filter, call) {
+		t.Errorf("Exported filter does not match syscall %d of architecture %s",
+			int(call), foreignArch.String())
+	}
+
+	// A syscall number that does not exist on the filter's architecture
+	// must be rejected.
+	if err := filter.AddRule(ScmpSyscall(99999), ActAllow); err == nil {
+		t.Errorf("Adding a rule with an invalid syscall number should fail")
+	}
+}
+
 func TestAddRuleErrors(t *testing.T) {
 	execInSubprocess(t, subprocessAddRuleErrors)
 }
