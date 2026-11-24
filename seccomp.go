@@ -623,8 +623,10 @@ type ScmpFilter struct {
 	lock      sync.Mutex
 }
 
-// NewFilter creates and returns a new filter context.  Accepts a default action to be
-// taken for syscalls which match no rules in the filter.
+// NewFilter creates and returns a new filter context. Accepts a default action
+// to be taken for syscalls which match no rules in the filter. To build a
+// multi-architecture filter, use a denying default action, add every
+// architecture with [ScmpFilter.AddArch], and only then add rules.
 // Returns a reference to a valid filter context, or nil and an error
 // if the filter context could not be created or an invalid default action was given.
 func NewFilter(defaultAction ScmpAction) (*ScmpFilter, error) {
@@ -668,6 +670,8 @@ func (f *ScmpFilter) IsValid() bool {
 
 // Reset resets a filter context, removing all its existing state.
 // Accepts a new default action to be taken for syscalls which do not match.
+// As with [NewFilter], a multi-architecture filter should be rebuilt by adding
+// every architecture before adding rules.
 // Returns an error if the filter or action provided are invalid.
 func (f *ScmpFilter) Reset(defaultAction ScmpAction) error {
 	f.lock.Lock()
@@ -773,6 +777,17 @@ func (f *ScmpFilter) IsArchPresent(arch ScmpArch) (bool, error) {
 }
 
 // AddArch adds an architecture to the filter.
+//
+// The filter's default action must deny syscalls (ActKillProcess,
+// ActKillThread, ActTrap, or ActErrno); otherwise AddArch returns an error.
+// AddArch also verifies that adding the architecture did not change the
+// default action, and returns an error if it did.
+//
+// Add all architectures immediately after creating or resetting the filter,
+// before adding rules. Libseccomp does not copy existing rules to an
+// architecture added later, so adding an architecture after rules leaves the
+// new architecture governed only by the default action.
+//
 // Accepts an architecture constant.
 // Returns an error on invalid filter context or architecture token, or an
 // issue with the call to libseccomp.
@@ -786,6 +801,25 @@ func (f *ScmpFilter) AddArch(arch ScmpArch) error {
 		return errBadFilter
 	}
 
+	// Adding an architecture must not change the default action: it is the
+	// fallback which ensures syscalls without an explicit rule are still
+	// denied on the new architecture.
+	rawDefaultAction, err := f.getFilterAttrLocked(filterAttrActDefault)
+	if err != nil {
+		return err
+	}
+
+	defaultAction, err := actionFromNative(rawDefaultAction)
+	if err != nil {
+		return err
+	}
+	if !actionIsDeny(defaultAction) {
+		return fmt.Errorf("%w: current default action is %q; add all architectures "+
+			"before adding rules, and use a denying default action such as ActErrno "+
+			"or ActKillThread instead of a non-deny action such as ActAllow",
+			errArchDefaultAction, defaultAction)
+	}
+
 	// Libseccomp returns -EEXIST if the specified architecture is already
 	// present. Succeed silently in this case, as it's not fatal, and the
 	// architecture is present already.
@@ -793,6 +827,21 @@ func (f *ScmpFilter) AddArch(arch ScmpArch) error {
 		if e := errRc(retCode); e != syscall.EEXIST {
 			return e
 		}
+	}
+
+	// Some libseccomp versions reset filter attributes when an architecture
+	// is added, which would silently turn a deny-by-default filter into an
+	// allow-by-default one. The default action attribute is read-only, so the
+	// best we can do is detect the change and fail loudly.
+	rawDefaultActionAfter, err := f.getFilterAttrLocked(filterAttrActDefault)
+	if err != nil {
+		return err
+	}
+	if rawDefaultActionAfter != rawDefaultAction {
+		return fmt.Errorf("%w: architecture %s was added with default action %#x instead of %#x; "+
+			"add all architectures before adding rules, or use a libseccomp version which "+
+			"preserves the default action", errArchDefaultActionChanged, arch,
+			uint32(rawDefaultActionAfter), uint32(rawDefaultAction))
 	}
 
 	return nil

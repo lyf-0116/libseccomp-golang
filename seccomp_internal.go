@@ -142,6 +142,12 @@ var (
 	// errBadFilter is thrown on bad filter context.
 	errBadFilter = errors.New("filter is invalid or uninitialized")
 	errDefAction = errors.New("requested action matches default action of filter")
+	// errArchDefaultAction is returned when an architecture is added to a
+	// filter whose default action does not deny syscalls.
+	errArchDefaultAction = errors.New("cannot add architecture: filter default action must deny syscalls")
+	// errArchDefaultActionChanged is returned when adding an architecture
+	// changes the filter default action.
+	errArchDefaultActionChanged = errors.New("cannot add architecture: libseccomp did not preserve the filter default action")
 	// errAPIUnsupported is returned when the libseccomp used lacks the API
 	// level operations, added in v2.4.0.
 	errAPIUnsupported = errors.New("API level operations are not supported")
@@ -253,10 +259,9 @@ func errRc(rc C.int) error {
 }
 
 // Get a raw filter attribute
-func (f *ScmpFilter) getFilterAttr(attr scmpFilterAttr) (C.uint32_t, error) {
-	f.lock.Lock()
-	defer f.lock.Unlock()
-
+// DOES NOT LOCK
+// Assumes caller has already done this
+func (f *ScmpFilter) getFilterAttrLocked(attr scmpFilterAttr) (C.uint32_t, error) {
 	if !f.valid {
 		return 0x0, errBadFilter
 	}
@@ -269,6 +274,14 @@ func (f *ScmpFilter) getFilterAttr(attr scmpFilterAttr) (C.uint32_t, error) {
 	}
 
 	return attribute, nil
+}
+
+// Get a raw filter attribute
+func (f *ScmpFilter) getFilterAttr(attr scmpFilterAttr) (C.uint32_t, error) {
+	f.lock.Lock()
+	defer f.lock.Unlock()
+
+	return f.getFilterAttrLocked(attr)
 }
 
 // Set a raw filter attribute
@@ -381,6 +394,18 @@ func sanitizeAction(in ScmpAction) error {
 	}
 
 	return nil
+}
+
+// actionIsDeny reports whether an action denies a syscall. Actions which defer
+// the decision (ActTrace, ActNotify) or permit the syscall (ActLog, ActAllow)
+// are not considered denying.
+func actionIsDeny(in ScmpAction) bool {
+	switch in & 0x0000FFFF {
+	case ActKillThread, ActKillProcess, ActTrap, ActErrno:
+		return true
+	default:
+		return false
+	}
 }
 
 func sanitizeCompareOp(in ScmpCompareOp) error {

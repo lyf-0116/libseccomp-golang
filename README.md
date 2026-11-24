@@ -54,6 +54,27 @@ respective websites: https://git-scm.com/docs/git and https://gnupg.org.
 
 	% go get github.com/seccomp/libseccomp-golang
 
+## Multiple architectures
+
+Add every architecture before adding rules, and use a denying default action
+(`ActKillProcess`, `ActKillThread`, `ActTrap`, or `ActErrno`):
+
+	filter, err := seccomp.NewFilter(seccomp.ActErrno.SetReturnCode(int16(syscall.EPERM)))
+	// ...
+	err = filter.AddArch(seccomp.ArchX86)
+	// ...
+	err = filter.AddRule(call, seccomp.ActAllow)
+
+`AddArch` rejects filters whose default action is not a denying action, and it
+verifies that adding the architecture did not change the default action. This
+keeps a deny-by-default policy from silently becoming allow-by-default on the
+new architecture.
+
+Libseccomp does not copy existing rules to an architecture added later, so an
+architecture added after rules is governed only by the default action. Code
+which previously created an allow-by-default filter and relied on `AddArch`
+must instead add all architectures up front and use a denying default action.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).

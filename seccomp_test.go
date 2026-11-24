@@ -4,6 +4,7 @@ package seccomp
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -403,6 +404,114 @@ func TestFilterArchFunctions(t *testing.T) {
 	}
 }
 
+func prospectiveArch(t *testing.T) ScmpArch {
+	t.Helper()
+
+	nativeArch, err := GetNativeArch()
+	if err != nil {
+		t.Fatalf("Error getting native architecture: %s", err)
+	}
+
+	arch := ArchX86
+	if nativeArch == ArchX86 {
+		arch = ArchAMD64
+	}
+
+	return arch
+}
+
+func TestAddArchPreservesDefaultAction(t *testing.T) {
+	defaultAction := ActErrno.SetReturnCode(int16(syscall.EPERM))
+
+	filter, err := NewFilter(defaultAction)
+	if err != nil {
+		t.Fatalf("Error creating filter: %s", err)
+	}
+	defer filter.Release()
+
+	call, err := GetSyscallFromName("read")
+	if err != nil {
+		t.Fatalf("Error resolving syscall: %s", err)
+	}
+	if err := filter.AddRule(call, ActAllow); err != nil {
+		t.Fatalf("Error adding allow rule: %s", err)
+	}
+
+	arch := prospectiveArch(t)
+	if err := filter.AddArch(arch); err != nil {
+		t.Fatalf("Error adding architecture %s: %s", arch, err)
+	}
+
+	action, err := filter.GetDefaultAction()
+	if err != nil {
+		t.Fatalf("Error getting default action: %s", err)
+	}
+	if action != defaultAction {
+		t.Fatalf("Default action changed after adding architecture: want %v, got %v",
+			defaultAction, action)
+	}
+}
+
+func TestAddArchAllowsDenyDefaultActions(t *testing.T) {
+	tests := []struct {
+		name   string
+		action ScmpAction
+	}{
+		{name: "kill thread", action: ActKillThread},
+		{name: "trap", action: ActTrap},
+		{name: "errno", action: ActErrno.SetReturnCode(int16(syscall.EPERM))},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			filter, err := NewFilter(tc.action)
+			if err != nil {
+				t.Fatalf("Error creating filter: %s", err)
+			}
+			defer filter.Release()
+
+			arch := prospectiveArch(t)
+			if err := filter.AddArch(arch); err != nil {
+				t.Fatalf("Error adding architecture %s: %s", arch, err)
+			}
+
+			action, err := filter.GetDefaultAction()
+			if err != nil {
+				t.Fatalf("Error getting default action: %s", err)
+			}
+			if action != tc.action {
+				t.Fatalf("Default action changed after adding architecture: want %v, got %v",
+					tc.action, action)
+			}
+		})
+	}
+}
+
+func TestAddArchRejectsNonDenyDefaultAction(t *testing.T) {
+	filter, err := NewFilter(ActAllow)
+	if err != nil {
+		t.Fatalf("Error creating filter: %s", err)
+	}
+	defer filter.Release()
+
+	arch := prospectiveArch(t)
+	err = filter.AddArch(arch)
+	if !errors.Is(err, errArchDefaultAction) {
+		t.Fatalf("Want error %v, got %v", errArchDefaultAction, err)
+	}
+	if !strings.Contains(err.Error(), "before adding rules") {
+		t.Errorf("Error lacks migration hint: %s", err)
+	}
+
+	present, err := filter.IsArchPresent(arch)
+	if err != nil {
+		t.Fatalf("Error checking architecture: %s", err)
+	}
+	if present {
+		t.Errorf("Architecture %s was added despite the error", arch)
+	}
+}
+
 func TestFilterAttributeGettersAndSetters(t *testing.T) {
 	filter, err := NewFilter(ActKillThread)
 	if err != nil {
@@ -526,12 +635,12 @@ func TestFilterAttributeGettersAndSetters(t *testing.T) {
 }
 
 func TestMergeFilters(t *testing.T) {
-	filter1, err := NewFilter(ActAllow)
+	filter1, err := NewFilter(ActKillThread)
 	if err != nil {
 		t.Errorf("Error creating filter: %s", err)
 	}
 
-	filter2, err := NewFilter(ActAllow)
+	filter2, err := NewFilter(ActKillThread)
 	if err != nil {
 		t.Errorf("Error creating filter: %s", err)
 	}
@@ -567,7 +676,7 @@ func TestMergeFilters(t *testing.T) {
 		t.Errorf("Source filter should not be valid after merging")
 	}
 
-	filter3, err := NewFilter(ActKillThread)
+	filter3, err := NewFilter(ActErrno.SetReturnCode(int16(syscall.EPERM)))
 	if err != nil {
 		t.Errorf("Error creating filter: %s", err)
 	}

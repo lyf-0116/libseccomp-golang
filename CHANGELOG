@@ -2,6 +2,11 @@ libseccomp-golang: Releases
 ===============================================================================
 https://github.com/seccomp/libseccomp-golang
 
+* Unreleased
+- AddArch now requires a denying default action (ActKillProcess, ActKillThread,
+  ActTrap, or ActErrno), preserves and verifies the default action, and points
+  callers to add all architectures before adding rules
+
 * Version 0.11.1 - August 5, 2025
 - Make GetArchFromString recognize "loong64"
 
